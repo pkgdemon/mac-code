@@ -905,6 +905,22 @@ def tool_edit(path_arg, body, work_dir="."):
     return _commit(path, content, original, f"edit {os.path.basename(path)}", notes)
 
 # ── code agent: parser + loop ───────────────────────
+# Result strings that mean the call did NOT do what it asked. These were
+# previously handed to the model but never printed, so a run of rejected edits
+# looked identical to a run of successful ones.
+FAIL_PREFIXES = ("edit rejected", "no search/replace block", "no such file",
+                 "refused", "error", "not found", "your ", "ambiguous",
+                 "appears", "no match", "unknown tool", "usage:")
+
+def tool_result_failed(result):
+    """True when a tool result reports a refusal or an error."""
+    head = (result or "").strip().lower()
+    return head.startswith(FAIL_PREFIXES) or head.startswith("no such")
+
+def _result_digest(call):
+    body = call.get("body") or call.get("content") or ""
+    return (call["tool"], call.get("path", ""), body[:400])
+
 TOOL_REGEX = re.compile(r"<(read|ls|search|shell)>(.+?)</\1>", re.DOTALL)
 ATTR_REGEX = re.compile(r'<(write|edit)\s+path="([^"]+)"\s*>(.*?)</\1>', re.DOTALL)
 # A call the model started but never closed — it ran out of tokens or missed the
@@ -990,6 +1006,9 @@ def run_code_agent(user_input, work_dir=".", history=None,
     start = time.time()
     final = ""
     limit_hit = False
+    fails = 0
+    last_sig = None
+    repeat = 0
 
     for step in range(max_iters):
         phase = "thinking" if step == 0 else "deciding next step"
@@ -1019,8 +1038,36 @@ def run_code_agent(user_input, work_dir=".", history=None,
         result = run_code_tool(call, work_dir)
         used.append(call["tool"])
 
+        # A refusal is invisible unless we say so. Without this a run of
+        # rejected edits looks exactly like a run of good ones.
+        if tool_result_failed(result):
+            fails += 1
+            shown = "\n".join(result.strip().splitlines()[:12])
+            console.print(f"    [yellow]rejected:[/] [dim]{shown}[/]")
+        else:
+            fails = 0
+
+        # Identical retry loops burn the whole budget and still accomplish
+        # nothing. Two in a row is enough to stop and report.
+        sig = _result_digest(call)
+        repeat = repeat + 1 if sig == last_sig else 0
+        last_sig = sig
+        if tool_result_failed(result) and repeat >= 1:
+            final = ("Stopped — the same edit was rejected twice in a row and "
+                     "retrying it is not converging.\n\n"
+                     f"Last rejection:\n{result.strip()[:600]}")
+            break
+
         convo.append({"role": "assistant", "content": text.strip()})
         convo.append({"role": "user", "content": f"<result>\n{result}\n</result>"})
+
+        if fails >= 2:
+            convo.append({"role": "user", "content":
+                          "<system_note>Two tool calls in a row have been rejected. "
+                          "Do not repeat the same call. Re-read the file and copy "
+                          "the SEARCH text out of it verbatim, or change approach: "
+                          "if the text you want already exists, say so instead of "
+                          "editing.</system_note>"})
 
         if step == max_iters - 1:
             limit_hit = True
