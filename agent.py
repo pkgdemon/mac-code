@@ -3,7 +3,7 @@
 mac code — claude code for your Mac
 """
 
-import json, sys, os, time, subprocess, re, threading, queue
+import json, sys, os, time, subprocess, re, threading, queue, difflib
 import urllib.request, random
 from datetime import datetime
 from pathlib import Path
@@ -44,7 +44,7 @@ def get_failure_stats():
     """Show stats from logged interactions."""
     total = 0
     graded = {"good": 0, "bad": 0}
-    intents = {"search": 0, "shell": 0, "chat": 0}
+    intents = {"search": 0, "shell": 0, "code": 0, "chat": 0}
     errors = 0
 
     for log_file in LOGS_DIR.glob("interactions-*.jsonl"):
@@ -102,21 +102,31 @@ TOOL_KEYWORDS = [
     "more about", "what else", "continue", "go deeper",
 ]
 
+VALID_INTENTS = ("search", "code", "shell", "chat")
+
 def classify_intent(message):
-    """Ask LLM to classify: 'search', 'shell', or 'chat'. One fast call (~1s)."""
+    """Ask LLM to classify: 'search', 'shell', 'code', or 'chat'. One fast call (~1s)."""
     try:
         result, _ = llm_call([
             {"role": "system", "content": """Classify the user's request into exactly one category. Reply with ONLY the category word, nothing else.
 
 Categories:
 - search: needs web search (news, scores, weather, prices, current events, looking up info online)
-- shell: needs filesystem or command execution (find files, list directories, read/write files, run commands, look at desktop, explore folders, check disk space, anything involving the local computer)
-- chat: general conversation, reasoning, math, coding questions, explanations (no tools needed)
+- code: wants a file on this computer created or CHANGED. Any request to edit, fix, refactor, rename, add to, or write a file, script, or function. Also "why does X crash" when X is a file in the working directory.
+- shell: needs to inspect the computer without changing anything (find files, list directories, read a file, check disk space, what is running on a port)
+- chat: general conversation, reasoning, math, and questions ABOUT code that do not require touching a file ("explain this regex", "what does this function do", "write me a snippet to try")
 
-Reply with ONLY one word: search, shell, or chat"""},
+The line between code and chat is whether a file gets modified. Explaining is chat. Changing is code.
+
+Reply with ONLY one word: search, code, shell, or chat"""},
             {"role": "user", "content": message},
         ], max_tokens=5, temperature=0.0)
-        return result.strip().lower().split()[0]
+        # Models like to answer "code." or "Category: code" — scan every token
+        # for a known label, and fall back to chat on anything unrecognised.
+        for tok in re.findall(r"[a-z]+", (result or "").lower()):
+            if tok in VALID_INTENTS:
+                return tok
+        return "chat"
     except Exception:
         return "chat"
 
@@ -378,6 +388,476 @@ def quick_search(query):
     ], max_tokens=1000)
 
     return content, timings.get("predicted_per_second", 0)
+
+# ── code agent: tag-based tool calling ─────────────
+# The model emits XML tags instead of a shell command, so file content travels
+# as data rather than being smuggled through `sp.run(shell=True)`. Generation
+# halts on the closing tag (llama-server `stop`), we run the tool, feed the
+# result back, and repeat. Pattern borrowed from
+# research/expert-sniper/distributed/mac_tensor/agent.py.
+#
+# Edits use verified SEARCH/REPLACE blocks: the SEARCH text must appear exactly
+# once in the file, so a mis-remembered or paraphrased snippet is rejected
+# instead of corrupting the file. Every write shows a diff and waits for y/n.
+
+READ_LINE_CAP = 400
+READ_CHAR_CAP = 12000
+MAX_TOOL_ITERATIONS = 6
+
+CODE_SYSTEM_PROMPT = """You are a coding agent working in {work_dir}. You read and change real files.
+
+Answer the user by either calling ONE tool and stopping, or replying with a short final answer and no tags.
+
+RULES
+1. Emit exactly ONE tool call, then STOP. The system runs it and shows you the result.
+2. Never write a <result> tag yourself. The system inserts results.
+3. Before editing a file you have not already read in this conversation, <read> it first.
+4. When you have enough information, answer in 1-3 sentences with no tags.
+5. Do not repeat a tool call that already succeeded.
+
+TOOLS
+<read>path</read>                 read a file and get back its exact text
+<ls>path</ls>                     list a directory
+<shell>command</shell>            run a read-only shell command
+<search>query</search>            web search
+<write path="p">body</write>      create a NEW file (refused if it already exists)
+<edit path="p">blocks</edit>      change an EXISTING file
+
+EDIT FORMAT
+<edit path="the/file.py">
+<<<<<<< SEARCH
+exact text copied from the file, character for character
+=======
+the replacement text
+>>>>>>> REPLACE
+</edit>
+
+You may put several SEARCH/REPLACE blocks in one <edit>. The SEARCH text must
+appear EXACTLY ONCE in the file, otherwise the edit is rejected and nothing is
+written. To change something that appears twice, write two blocks, each with
+more surrounding lines to make it unique. Never reformat, reorder, or
+"improve" code you were not asked to change. Match the file's existing style.
+
+EXAMPLE
+User: change the greeting in greet.py to Spanish
+You: <read>greet.py</read>
+[system: <result>def greet():
+    return "Hello"</result>]
+You: <edit path="greet.py">
+<<<<<<< SEARCH
+    return "Hello"
+=======
+    return "Hola"
+>>>>>>> REPLACE
+</edit>
+[system: <result>Updated greet.py (2 lines).</result>]
+You: Changed the greeting to Spanish.
+
+Now the user asks:
+"""
+
+# ── code agent: tools ───────────────────────────────
+DESTRUCTIVE = ["rm ", "rm -", "mv ", "dd ", "mkfs", "chmod", "chown", "sudo",
+               "kill", "shutdown", "reboot", "diskutil", "curl ", "wget ",
+               "defaults delete", "> /dev/"]
+
+def _resolve(path, work_dir="."):
+    p = os.path.expanduser((path or "").strip().strip('"').strip("'"))
+    if not p:
+        p = "."
+    if not os.path.isabs(p):
+        p = os.path.join(work_dir, p)
+    return os.path.normpath(p)
+
+def tool_read(arg, work_dir="."):
+    path = _resolve(arg, work_dir)
+    if os.path.isdir(path):
+        return f"{path} is a directory. Use <ls>{path}</ls>."
+    if not os.path.isfile(path):
+        return f"No such file: {path}"
+    try:
+        with open(path, "r", errors="replace") as f:
+            raw = f.read()
+    except Exception as e:
+        return f"Error reading {path}: {e}"
+    lines = raw.splitlines()
+    total = len(lines)
+    truncated = False
+    if total > READ_LINE_CAP:
+        lines = lines[:READ_LINE_CAP]
+        truncated = True
+    body = "\n".join(lines)
+    if len(body) > READ_CHAR_CAP:
+        body = body[:READ_CHAR_CAP]
+        truncated = True
+    out = f"{path} ({total} lines)\n{body}"
+    if truncated:
+        out += (f"\n... TRUNCATED. You are seeing the first {len(lines)} lines. "
+                "Only edit text you can actually see here.")
+    return out
+
+def tool_ls(arg, work_dir="."):
+    path = _resolve(arg or ".", work_dir)
+    if not os.path.isdir(path):
+        return f"Not a directory: {path}"
+    try:
+        entries = sorted(os.listdir(path))
+    except Exception as e:
+        return f"Error: {e}"
+    lines = []
+    for name in entries[:120]:
+        full = os.path.join(path, name)
+        if os.path.isdir(full):
+            lines.append(f"{name}/")
+        else:
+            try:
+                lines.append(f"{name}  ({os.path.getsize(full):,}b)")
+            except OSError:
+                lines.append(name)
+    out = f"{path}\n" + "\n".join(lines)
+    if len(entries) > 120:
+        out += f"\n... and {len(entries) - 120} more"
+    return out
+
+def tool_shell(arg, work_dir="."):
+    cmd = arg.strip()
+    low = cmd.lower()
+    for d in DESTRUCTIVE:
+        if d in low:
+            return (f"Refused (blocked: {d.strip()}). To change files use "
+                    "<read> then <edit>. Use a different command for this.")
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           timeout=30, cwd=work_dir)
+    except subprocess.TimeoutExpired:
+        return "Error: timed out after 30s"
+    except Exception as e:
+        return f"Error: {e}"
+    parts = []
+    if r.stdout.strip():
+        parts.append(r.stdout.strip()[:3000])
+    if r.stderr.strip():
+        parts.append(f"[stderr] {r.stderr.strip()[:800]}")
+    parts.append(f"[exit {r.returncode}]")
+    return "\n".join(parts)
+
+def tool_search_raw(query):
+    """Search without extra LLM round-trips — the loop feeds raw hits back."""
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            return "Search unavailable: pip install ddgs"
+    try:
+        hits = list(DDGS().text(query, max_results=6))
+    except Exception as e:
+        return f"Search failed: {e}"
+    if not hits:
+        return "No results."
+    out = []
+    for h in hits[:6]:
+        title = h.get("title", "")
+        body = (h.get("body") or h.get("snippet") or "")[:220]
+        url = h.get("href") or h.get("url") or ""
+        out.append(f"• {title}\n  {body}\n  {url}")
+    return "\n".join(out)
+
+# ── code agent: verified edits ──────────────────────
+BLOCK_RE = re.compile(
+    r"<{5,}\s*SEARCH[ \t]*\r?\n(.*?)\r?\n\s*={5,}[ \t]*\r?\n(.*?)\r?\n\s*>{5,}\s*REPLACE",
+    re.DOTALL,
+)
+
+def _closest_lines(old, lines):
+    """Point the model at what is actually in the file so it can retry."""
+    first = next((l.strip() for l in old.splitlines() if l.strip()), "")
+    if not first:
+        return ""
+    key = re.sub(r"\W+", "", first)[:24].lower()
+    if not key:
+        return ""
+    for i, ln in enumerate(lines):
+        if key in re.sub(r"\W+", "", ln)[:len(key) + 10].lower():
+            lo, hi = max(0, i - 1), min(len(lines), i + 3)
+            body = "\n".join(f"  {j+1}: {lines[j]}" for j in range(lo, hi))
+            return f"Closest line in the file:\n{body}"
+    return f"No line in the file resembles {first!r}. Re-read the file before editing."
+
+def _match_lines_rstrip(content_lines, old_lines):
+    """Line-wise match ignoring trailing whitespace only.
+
+    Leading whitespace must match exactly — an earlier \s+-based version
+    re-applied the matched whitespace and doubled indentation, which silently
+    corrupts Python. Returns the start index, "ambiguous", or None.
+    """
+    n, m = len(content_lines), len(old_lines)
+    if m == 0 or m > n:
+        return None
+    hits = []
+    for i in range(n - m + 1):
+        if all(c.rstrip() == o.rstrip()
+               for c, o in zip(content_lines[i:i + m], old_lines)):
+            hits.append(i)
+    if len(hits) == 1:
+        return hits[0]
+    return "ambiguous" if hits else None
+
+def _replace_once(content, old, new, path):
+    """Apply one SEARCH/REPLACE. Exact match only, uniqueness enforced."""
+    if not old.strip():
+        return False, content, "Refused: the SEARCH block was empty."
+
+    n = content.count(old)
+    if n == 1:
+        return True, content.replace(old, new, 1), None
+    if n > 1:
+        return False, content, (
+            f"The SEARCH text appears {n} times in {path} — ambiguous, nothing was "
+            "written. Include more surrounding lines so it matches exactly one spot.")
+
+    # Retry line-by-line, tolerating trailing whitespace only. Uniqueness is
+    # still required, and the drift is surfaced in the diff before writing.
+    old_lines = old.splitlines()
+    new_lines = new.splitlines()
+    lines = content.splitlines(keepends=True)
+    idx = _match_lines_rstrip(lines, old_lines)
+
+    if idx == "ambiguous":
+        return False, content, (
+            f"The SEARCH text matches more than one place in {path} once trailing "
+            "whitespace is ignored — ambiguous, nothing was written. Add more "
+            "surrounding lines.")
+    if idx is None:
+        return False, content, (
+            f"The SEARCH text was not found in {path} — nothing was written. "
+            "It must match exactly, including indentation.\n"
+            + _closest_lines(old, content.splitlines()))
+
+    end = idx + len(old_lines)
+    nl = "\r\n" if "\r\n" in "".join(lines[idx:end]) else "\n"
+    had_final_nl = lines[end - 1].endswith(("\n", "\r"))
+    block = "".join(l + nl for l in new_lines)
+    if new_lines and not had_final_nl:
+        block = block[: -len(nl)]
+    return True, "".join(lines[:idx]) + block + "".join(lines[end:]), \
+        "SEARCH matched ignoring trailing whitespace"
+
+def _render_diff(path, original, new_content, label, notes):
+    diff = list(difflib.unified_diff(
+        (original if original is not None else "").splitlines(keepends=True),
+        new_content.splitlines(keepends=True),
+        fromfile=f"a/{os.path.basename(path)}" if original is not None else "/dev/null",
+        tofile=f"b/{os.path.basename(path)}",
+        n=3,
+    ))
+    if not diff:
+        return False
+
+    console.print()
+    head = Text()
+    head.append(f"  {label}  ", style="bold bright_yellow")
+    head.append(path, style="bold white")
+    console.print(head)
+    for note in (notes or []):
+        console.print(f"    [dim]note: {note}[/]")
+    console.print()
+
+    for line in "".join(diff).rstrip("\n").split("\n"):
+        if line.startswith(("+++", "---")):
+            console.print(f"  [dim]{line}[/]")
+        elif line.startswith("@@"):
+            console.print(f"  [cyan]{line}[/]")
+        elif line.startswith("+"):
+            console.print(f"  [green]{line}[/]")
+        elif line.startswith("-"):
+            console.print(f"  [red]{line}[/]")
+        else:
+            console.print(f"  [dim]{line}[/]")
+    console.print()
+    return True
+
+def _confirm_apply(path, new_content, original):
+    """Ask on the main thread — callers must not be inside a worker thread."""
+    prompt = Text()
+    prompt.append("  apply this change?  ", style="bold bright_green")
+    prompt.append("[y/N] ", style="dim")
+    console.print(prompt, end="")
+    try:
+        ans = input().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+    console.print()
+    if ans not in ("y", "yes"):
+        return f"Declined by the user — {path} was NOT modified."
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(new_content)
+    except Exception as e:
+        return f"Write failed: {e}"
+    verb = "Created" if original is None else "Updated"
+    return (f"{verb} {path} ({len(new_content.splitlines())} lines). "
+            "Check it with <shell>git diff "
+            f"{os.path.basename(path)}</shell> or read it back.")
+
+def _commit(path, new_content, original, label, notes=None):
+    if original is not None and new_content == original:
+        return f"No change — {path} already matches. Nothing written."
+    if not _render_diff(path, original, new_content, label, notes):
+        return f"No change — {path} already matches. Nothing written."
+    return _confirm_apply(path, new_content, original)
+
+def tool_write(path_arg, content, work_dir="."):
+    path = _resolve(path_arg, work_dir)
+    if os.path.exists(path):
+        return (f"Refused: {path} already exists. Use "
+                f'<edit path="{path}"> to change it, or pick another name.')
+    return _commit(path, content, None, f"create {os.path.basename(path)}")
+
+def tool_edit(path_arg, body, work_dir="."):
+    path = _resolve(path_arg, work_dir)
+    if not os.path.isfile(path):
+        return f"No such file: {path}. Use <write> to create it."
+    try:
+        with open(path, "r", errors="replace") as f:
+            original = f.read()
+    except Exception as e:
+        return f"Error reading {path}: {e}"
+
+    blocks = BLOCK_RE.findall(body)
+    if not blocks:
+        return ("No SEARCH/REPLACE block found. The required form is:\n"
+                "<<<<<<< SEARCH\nold text\n=======\nnew text\n>>>>>>> REPLACE")
+
+    content = original
+    notes = []
+    for old, new in blocks:
+        ok, content, note = _replace_once(content, old, new, path)
+        if not ok:
+            return f"Edit rejected, nothing written.\n{note}"
+        if note:
+            notes.append(note)
+
+    return _commit(path, content, original, f"edit {os.path.basename(path)}", notes)
+
+# ── code agent: parser + loop ───────────────────────
+TOOL_REGEX = re.compile(r"<(read|ls|search|shell)>(.+?)</\1>", re.DOTALL)
+ATTR_REGEX = re.compile(r'<(write|edit)\s+path="([^"]+)"\s*>(.*?)</\1>', re.DOTALL)
+CODE_STOP = ["</read>", "</ls>", "</search>", "</shell>", "</write>", "</edit>"]
+
+def parse_code_tool(text):
+    """Find the first complete tool call in the model's output."""
+    m = ATTR_REGEX.search(text)
+    if m:
+        return {"tool": m.group(1), "path": m.group(2), "body": m.group(3),
+                "start": m.start(), "end": m.end()}
+    m = TOOL_REGEX.search(text)
+    if m:
+        return {"tool": m.group(1), "content": m.group(2),
+                "start": m.start(), "end": m.end()}
+    return None
+
+def run_code_tool(call, work_dir="."):
+    t = call["tool"]
+    if t == "read":   return tool_read(call["content"], work_dir)
+    if t == "ls":     return tool_ls(call["content"], work_dir)
+    if t == "shell":  return tool_shell(call["content"], work_dir)
+    if t == "search": return tool_search_raw(call["content"])
+    if t == "write":  return tool_write(call["path"], call["body"], work_dir)
+    if t == "edit":   return tool_edit(call["path"], call["body"], work_dir)
+    return f"Unknown tool: {t}"
+
+def llm_call_code(convo, max_tokens=3000, temperature=0.2):
+    payload = json.dumps({
+        "model": "local",
+        "messages": convo,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stop": CODE_STOP,
+    }).encode()
+    req = urllib.request.Request(
+        f"{SERVER}/v1/chat/completions", data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    d = json.loads(urllib.request.urlopen(req, timeout=180).read())
+    return d["choices"][0]["message"]["content"], d.get("timings", {})
+
+def run_code_agent(user_input, work_dir=".", history=None,
+                   max_iters=MAX_TOOL_ITERATIONS):
+    """Tag-based tool loop.
+
+    Returns (final_text, tokens, elapsed, tools_used, convo). `convo` carries the
+    full exchange including tool results so the caller can persist it as history.
+    """
+    convo = [{"role": "system", "content": CODE_SYSTEM_PROMPT.format(work_dir=work_dir)}]
+    convo += [dict(m) for m in (history or [])]
+    convo.append({"role": "user", "content": user_input})
+
+    used = []
+    tokens = 0
+    start = time.time()
+    final = ""
+    limit_hit = False
+
+    for step in range(max_iters):
+        out, err = [None], [None]
+
+        def work():
+            try:
+                out[0] = llm_call_code(convo)
+            except Exception as e:
+                err[0] = e
+
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+
+        display = WorkingDisplay()
+        display.phase = "thinking" if step == 0 else "deciding next step"
+        with Live(display.render(), console=console,
+                  refresh_per_second=8, transient=True) as live:
+            while th.is_alive():
+                display.frame += 1
+                live.update(display.render())
+                time.sleep(0.12)
+        th.join(timeout=1)
+
+        if err[0] is not None or out[0] is None:
+            final = f"[error] {err[0] or 'no response from model'}"
+            break
+
+        text, timings = out[0]
+        tokens += timings.get("predicted_n") or 0
+        call = parse_code_tool(text)
+
+        if not call:
+            final = text.strip()
+            break
+
+        preamble = text[:call["start"]].strip()
+        if preamble:
+            console.print(f"  [dim]{preamble[:200]}[/]")
+
+        target = call.get("path") or (call.get("content") or "").strip()[:40]
+        console.print(f"  [dim]▸ {call['tool']} {os.path.basename(target)}[/]")
+
+        result = run_code_tool(call, work_dir)
+        used.append(call["tool"])
+
+        convo.append({"role": "assistant", "content": text.strip()})
+        convo.append({"role": "user", "content": f"<result>\n{result}\n</result>"})
+
+        if step == max_iters - 1:
+            limit_hit = True
+
+    if limit_hit and not final:
+        final = ("Stopped at the tool-call limit. The last tool ran — ask me to "
+                 "continue if the job is not finished.")
+
+    return final, tokens, time.time() - start, used, convo
 
 def get_current_model():
     """Check which model the running server has loaded."""
@@ -865,7 +1345,8 @@ def main():
                     t.append(name, style="bold bright_cyan")
                     t.append(f"  {desc}", style="dim")
                     console.print(t)
-                console.print()
+                console.print("  [dim]code mode (<read> <edit> <write> <ls> <shell> <search>) "
+                              "handles file changes[/]\n")
                 continue
             elif exact == "/agent":
                 use_agent = True
@@ -962,6 +1443,7 @@ def main():
                 t.add_row("errors", str(stats["errors"]))
                 t.add_row("searches", str(stats["intents"].get("search", 0)))
                 t.add_row("shell", str(stats["intents"].get("shell", 0)))
+                t.add_row("code", str(stats["intents"].get("code", 0)))
                 t.add_row("chat", str(stats["intents"].get("chat", 0)))
                 t.add_row("logs", str(LOGS_DIR))
                 console.print(t)
@@ -1298,6 +1780,42 @@ def main():
                     session_time += elapsed
                     session_turns += 1
                     messages.append({"role": "assistant", "content": full})
+
+            elif intent == "code":
+                # File create/edit → tag-based tool loop, chains read → edit
+                try:
+                    response, tokens, elapsed, used, convo = run_code_agent(
+                        user_input, work_dir, history=messages
+                    )
+                except Exception as e:
+                    console.print(f"  [bold red]{e}[/]")
+                    continue
+
+                console.print()
+                if response:
+                    render_response(response)
+                console.print()
+
+                speed = tokens / elapsed if elapsed > 0 else 0
+                s = Text()
+                s.append("  ▸ code", style="bold bright_cyan")
+                s.append(f"  {elapsed:.1f}s", style="dim")
+                if speed > 0:
+                    s.append(f"  {speed:.1f} tok/s", style="bright_green")
+                if used:
+                    s.append(f"  ·  {len(used)} tool call"
+                             f"{'s' if len(used) != 1 else ''}", style="dim")
+                    s.append(f" ({', '.join(used)})", style="dim italic")
+                console.print(s)
+
+                session_tokens += tokens
+                session_time += elapsed
+                session_turns += 1
+                last_interaction = {"query": user_input, "intent": "code",
+                                    "response": response, "speed": speed}
+                # Persist the tool traffic so follow-ups keep the file context.
+                messages[:] = [m for m in convo if m["role"] != "system"]
+
             else:
                 # Direct LLM streaming (no tools needed)
                 messages.append({"role": "user", "content": user_input})
