@@ -729,6 +729,9 @@ BLOCK_RE = re.compile(
     r"<{5,}\s*SEARCH[ \t]*\r?\n(.*?)\r?\n\s*={5,}[ \t]*\r?\n(.*?)\r?\n\s*>{5,}\s*REPLACE",
     re.DOTALL,
 )
+# Counts block openers on their own, so a half-written trailing block is visible
+# even though BLOCK_RE will not match it.
+SEARCH_MARK_RE = re.compile(r"<{5,}\s*SEARCH[ \t]*\r?\n")
 
 def _closest_lines(old, lines):
     """Point the model at what is actually in the file so it can retry."""
@@ -933,6 +936,17 @@ UNCLOSED_REGEX = re.compile(r"<(read|ls|search|shell)>([^<]*)$", re.DOTALL)
 TRUNCATED_REGEX = re.compile(r'<(write|edit)\s+path="([^"]+)"\s*>(.*)$', re.DOTALL)
 CODE_STOP = ["</read>", "</ls>", "</search>", "</shell>", "</write>", "</edit>"]
 
+def _edit_body_is_complete(body):
+    """True when every SEARCH block in the body is fully closed.
+
+    A single complete block is not enough: a body can hold one finished block
+    followed by a second that was cut off, and applying only the first would
+    silently discard the rest.
+    """
+    openers = len(SEARCH_MARK_RE.findall(body or ""))
+    closed = len(BLOCK_RE.findall(body or ""))
+    return openers > 0 and openers == closed
+
 def parse_code_tool(text):
     """Find the first complete tool call in the model's output."""
     m = ATTR_REGEX.search(text)
@@ -949,17 +963,28 @@ def parse_code_tool(text):
                 "start": m.start(), "end": len(text), "recovered": True}
     m = TRUNCATED_REGEX.search(text)
     if m:
-        return {"tool": m.group(1), "path": m.group(2), "body": m.group(3),
+        body = m.group(3)
+        # A missing </edit> is only dangerous if the CONTENT is also cut off.
+        # A closed ">>>>>>> REPLACE" marker means every block is structurally
+        # complete, so the edit is safe to run — and refusing it just makes the
+        # model re-emit the same call until it exhausts the budget. This is what
+        # both the 9B and the 35B do on long README edits.
+        if m.group(1) == "edit" and _edit_body_is_complete(body):
+            return {"tool": "edit", "path": m.group(2), "body": body,
+                    "start": m.start(), "end": len(text), "unclosed_tag": True}
+        return {"tool": m.group(1), "path": m.group(2), "body": body,
                 "start": m.start(), "end": len(text), "truncated": True}
     return None
 
 def run_code_tool(call, work_dir="."):
     t = call["tool"]
+    # Only fires when the CONTENT was cut off, not merely the closing tag. A
+    # partial body would silently drop the tail, so it is never written.
     if call.get("truncated"):
-        return (f"Your {t} call for {call.get('path')} was cut off — the closing "
-                f"</{t}> tag is missing — so nothing was written. Re-emit the "
-                "complete call including the closing tag. If the content is long, "
-                "make the change smaller: one edit per call, a few lines each.")
+        return (f"Your {t} call for {call.get('path')} was cut off mid-content — "
+                f"the {t} body never finished, so nothing was written. Re-read "
+                "the file and make the change smaller: one edit per call, a few "
+                "lines each, and close the call with </" + t + ">.")
     if t == "read":   return tool_read(call["content"], work_dir)
     if t == "ls":     return tool_ls(call["content"], work_dir)
     if t == "shell":  return tool_shell(call["content"], work_dir)
@@ -1034,6 +1059,9 @@ def run_code_agent(user_input, work_dir=".", history=None,
 
         target = call.get("path") or (call.get("content") or "").strip()[:40]
         console.print(f"  [dim]▸ {call['tool']} {os.path.basename(target)}[/]")
+        if call.get("unclosed_tag"):
+            console.print("    [dim](you dropped the closing </edit> tag — the "
+                          "block was complete, so I ran it anyway)[/]")
 
         result = run_code_tool(call, work_dir)
         used.append(call["tool"])
