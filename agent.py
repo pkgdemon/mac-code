@@ -3,7 +3,7 @@
 mac code — claude code for your Mac
 """
 
-import json, sys, os, time, subprocess, re, threading, queue, difflib
+import json, sys, os, time, subprocess, re, threading, queue, difflib, select
 import urllib.request, random
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +19,48 @@ from rich.padding import Padding
 from rich.columns import Columns
 
 SERVER = os.environ.get("LLAMA_URL", "http://localhost:8000")
+
+# ── input: treat a pasted block as one entry ───────
+# input() returns at the first newline, so pasting a shell snippet sends every
+# line as its own turn and the agent then tries to execute the fragments. After
+# the first line, check whether more data is already waiting on stdin — that
+# only happens on a paste, never on someone typing.
+
+def _stdin_is_tty():
+    try:
+        return sys.stdin.isatty() and sys.stdin.fileno() >= 0
+    except Exception:
+        return False
+
+def read_multiline_input(paste_gap=0.12):
+    """Read one logical entry, joining lines that arrive as a single paste."""
+    line = input()
+    if not _stdin_is_tty():
+        return line
+
+    parts = [line]
+    while True:
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], paste_gap)
+        except Exception:
+            break
+        if not ready:
+            break
+        try:
+            nxt = sys.stdin.readline()
+        except Exception:
+            break
+        if not nxt:
+            break
+        parts.append(nxt.rstrip("\r\n"))
+
+    return "\n".join(parts)
+
+def shell_command_looks_complete(cmd):
+    """Reject truncated fragments, e.g. a paste that stopped at `python3 -c "`."""
+    if cmd.rstrip().endswith("\\"):
+        return False
+    return all(cmd.count(ch) % 2 == 0 for ch in ('"', "'", "`"))
 
 # ── Self-improvement: failure logging ─────────────
 LOGS_DIR = Path.home() / ".mac-code" / "logs"
@@ -197,6 +239,14 @@ def run_smart_tool(query, work_dir="."):
 
     # Step 1: LLM generates the command (~1s)
     cmd = generate_shell_command(query, work_dir)
+
+    # A truncated fragment (from a partial paste, or a model that stopped
+    # mid-token) is never worth running — it only produces a confusing error.
+    if not shell_command_looks_complete(cmd):
+        console.print(f"  [yellow]skipped an incomplete command:[/] [dim]{cmd[:120]}[/]")
+        console.print("  [dim]that looked like a cut-off paste — send the whole "
+                      "block in one go[/]\n")
+        return None, 0, cmd
 
     # Step 2: Execute it
     try:
@@ -813,6 +863,10 @@ def tool_edit(path_arg, body, work_dir="."):
 # ── code agent: parser + loop ───────────────────────
 TOOL_REGEX = re.compile(r"<(read|ls|search|shell)>(.+?)</\1>", re.DOTALL)
 ATTR_REGEX = re.compile(r'<(write|edit)\s+path="([^"]+)"\s*>(.*?)</\1>', re.DOTALL)
+# A call the model started but never closed — it ran out of tokens or missed the
+# stop sequence. Only the single-line read-only tools are recoverable; a
+# truncated <write>/<edit> body would silently drop content, so never guess.
+UNCLOSED_REGEX = re.compile(r"<(read|ls|search|shell)>([^<]*)$", re.DOTALL)
 CODE_STOP = ["</read>", "</ls>", "</search>", "</shell>", "</write>", "</edit>"]
 
 def parse_code_tool(text):
@@ -825,6 +879,10 @@ def parse_code_tool(text):
     if m:
         return {"tool": m.group(1), "content": m.group(2),
                 "start": m.start(), "end": m.end()}
+    m = UNCLOSED_REGEX.search(text)
+    if m:
+        return {"tool": m.group(1), "content": m.group(2).strip(),
+                "start": m.start(), "end": len(text), "recovered": True}
     return None
 
 def run_code_tool(call, work_dir="."):
@@ -1358,13 +1416,17 @@ def main():
             cur = get_current_model() or "?"
             tag = f"{'auto' if auto_route else 'agent'} {cur}" if use_agent else "raw"
             console.print(f"  [dim]{tag}[/] [bold bright_yellow]>[/] ", end="")
-            user_input = input()
+            user_input = read_multiline_input()
         except (EOFError, KeyboardInterrupt):
             console.print()
             break
 
         if not user_input.strip():
             continue
+
+        if "\n" in user_input.strip():
+            n = user_input.strip().count("\n") + 1
+            console.print(f"  [dim]pasted {n} lines — sending as one request[/]")
 
         cmd = user_input.strip()
         cmd_lower = cmd.lower()
