@@ -324,6 +324,28 @@ def run_file_tool(query, work_dir="."):
 
     return content, timings.get("predicted_per_second", 0), tool_name
 
+def llm_error_text(exc):
+    """Pull llama.cpp's real error out of an HTTPError body.
+
+    The server reports things like "Error: Compute error." in a 500 JSON body.
+    Without this the user only ever sees a generic failure, or a spinner that
+    never stops.
+    """
+    try:
+        body = exc.read().decode("utf-8", "replace")
+    except Exception:
+        return str(exc)
+    try:
+        d = json.loads(body)
+    except Exception:
+        return body.strip()[:300] or str(exc)
+    err = d.get("error")
+    if isinstance(err, dict):
+        return err.get("message") or json.dumps(err)[:300]
+    if isinstance(err, str):
+        return err
+    return d.get("detail") or body.strip()[:300] or str(exc)
+
 def llm_call(messages, max_tokens=300, temperature=0.1):
     """Single LLM call, returns content + timings."""
     payload = json.dumps({
@@ -337,7 +359,11 @@ def llm_call(messages, max_tokens=300, temperature=0.1):
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    d = json.loads(urllib.request.urlopen(req, timeout=60).read())
+    try:
+        raw = urllib.request.urlopen(req, timeout=60).read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"llama-server rejected the request: {llm_error_text(e)}")
+    d = json.loads(raw)
     return d["choices"][0]["message"]["content"], d.get("timings", {})
 
 def quick_search(query):
@@ -823,7 +849,11 @@ def llm_call_code(convo, max_tokens=3000, temperature=0.2):
         f"{SERVER}/v1/chat/completions", data=payload,
         headers={"Content-Type": "application/json"},
     )
-    d = json.loads(urllib.request.urlopen(req, timeout=180).read())
+    try:
+        raw = urllib.request.urlopen(req, timeout=180).read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"llama-server rejected the request: {llm_error_text(e)}")
+    d = json.loads(raw)
     return d["choices"][0]["message"]["content"], d.get("timings", {})
 
 def run_code_agent(user_input, work_dir=".", history=None,
@@ -841,31 +871,16 @@ def run_code_agent(user_input, work_dir=".", history=None,
 
     used = []
     tokens = 0
+    out, err = [None], [None]
     start = time.time()
     final = ""
     limit_hit = False
 
     for step in range(max_iters):
-        out, err = [None], [None]
-
-        def work():
-            try:
-                out[0] = llm_call_code(convo)
-            except Exception as e:
-                err[0] = e
-
-        th = threading.Thread(target=work, daemon=True)
-        th.start()
-
-        display = WorkingDisplay()
-        display.phase = "thinking" if step == 0 else "deciding next step"
-        with Live(display.render(), console=console,
-                  refresh_per_second=8, transient=True) as live:
-            while th.is_alive():
-                display.frame += 1
-                live.update(display.render())
-                time.sleep(0.12)
-        th.join(timeout=1)
+        phase = "thinking" if step == 0 else "deciding next step"
+        out[0], err[0] = call_with_spinner(
+            lambda: llm_call_code(convo), [(float("inf"), phase)],
+            deadline=200)
 
         if err[0] is not None or out[0] is None:
             final = f"[error] {err[0] or 'no response from model'}"
@@ -1027,6 +1042,55 @@ class WorkingDisplay:
             t.append(f"    {log}\n", style="dim italic")
 
         return t
+
+def call_with_spinner(fn, phases, deadline=90):
+    """Run fn on a worker thread behind the live spinner.
+
+    Returns (result, error). Two things this fixes: the old `while
+    thread.is_alive()` loops had no bound, so a wedged inference server left the
+    UI spinning forever, and they swallowed the exception, so the real cause
+    never reached the user.
+    """
+    box = {}
+
+    def work():
+        try:
+            box["result"] = fn()
+        except Exception as e:
+            box["error"] = e
+
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+
+    display = WorkingDisplay()
+    start = time.time()
+    timed_out = False
+    with Live(display.render(), console=console,
+              refresh_per_second=8, transient=True) as live:
+        while th.is_alive():
+            if time.time() - start > deadline:
+                timed_out = True
+                break
+            t = time.time() - start
+            for limit, phase in phases:
+                if t < limit:
+                    display.phase = phase
+                    break
+            display.frame += 1
+            live.update(display.render())
+            time.sleep(0.12)
+    th.join(timeout=0.5)
+
+    if timed_out:
+        return None, RuntimeError(
+            f"llama-server did not respond within {deadline:.0f}s. It is probably "
+            "wedged or out of memory — check its terminal for 'Compute error' or "
+            f"an OOM message, and verify it is alive: curl {SERVER}/health")
+    return box.get("result"), box.get("error")
+
+def server_hint():
+    return ("check that llama-server is running and healthy: "
+            f"curl {SERVER}/health")
 
 # ── detect model ───────────────────────────────────
 def detect_model():
@@ -1672,25 +1736,14 @@ def main():
         if use_agent:
             start = time.time()
 
-            # LLM classifies intent: search, shell, or chat (~1s)
-            display = WorkingDisplay()
-            display.phase = "classifying"
-            intent_result = [None]
-
-            def do_classify():
-                intent_result[0] = classify_intent(user_input)
-
-            cls_thread = threading.Thread(target=do_classify, daemon=True)
-            cls_thread.start()
-
-            with Live(display.render(), console=console, refresh_per_second=8, transient=True) as live:
-                while cls_thread.is_alive():
-                    display.frame += 1
-                    live.update(display.render())
-                    time.sleep(0.12)
-
-            cls_thread.join(timeout=1)
-            intent = intent_result[0] or "chat"
+            # LLM classifies intent: search, code, shell, or chat (~1s)
+            classified, cls_err = call_with_spinner(
+                lambda: classify_intent(user_input),
+                [(2, "classifying")], deadline=25)
+            if cls_err is not None and classified is None:
+                console.print(f"  [yellow]classifier unavailable ({cls_err}); "
+                              f"assuming chat[/]")
+            intent = classified or "chat"
 
             # Safety net: a mis-routed edit request is invisible — the model
             # just answers in chat and no file is ever touched. Catch the
@@ -1701,35 +1754,16 @@ def main():
             # Route based on LLM classification
             if intent == "shell":
                 # File/system operations → LLM generates shell command
-                display = WorkingDisplay()
-                display.phase = "running command"
-                tool_result = [None]
-
-                def do_tool():
-                    try:
-                        tool_result[0] = run_smart_tool(user_input, work_dir)
-                    except Exception as e:
-                        tool_result[0] = None
-
-                tool_thread = threading.Thread(target=do_tool, daemon=True)
-                tool_thread.start()
-
-                with Live(display.render(), console=console, refresh_per_second=8, transient=True) as live:
-                    while tool_thread.is_alive():
-                        display.frame += 1
-                        t = time.time() - start
-                        if t < 2:
-                            display.phase = "generating command"
-                        elif t < 5:
-                            display.phase = "executing"
-                        else:
-                            display.phase = "reading results"
-                        live.update(display.render())
-                        time.sleep(0.12)
-
-                tool_thread.join(timeout=1)
-                result = tool_result[0]
+                result, tool_err = call_with_spinner(
+                    lambda: run_smart_tool(user_input, work_dir),
+                    [(2, "generating command"), (5, "executing"),
+                     (float("inf"), "reading results")], deadline=150)
                 elapsed = time.time() - start
+
+                if tool_err is not None and result is None:
+                    console.print(f"  [bold red]command failed[/]  [dim]{tool_err}[/]")
+                    console.print(f"  [dim]{server_hint()}[/]\n")
+                    result = None
 
                 if result:
                     response, speed, cmd = result
@@ -1755,35 +1789,14 @@ def main():
 
             elif intent == "search":
                 # Web search → fast direct path (~3-5s)
-                display = WorkingDisplay()
-                display.phase = "searching the web"
-                search_result = [None]
-
-                def do_search():
-                    try:
-                        search_result[0] = quick_search(user_input)
-                    except Exception:
-                        search_result[0] = None
-
-                search_thread = threading.Thread(target=do_search, daemon=True)
-                search_thread.start()
-
-                with Live(display.render(), console=console, refresh_per_second=8, transient=True) as live:
-                    while search_thread.is_alive():
-                        display.frame += 1
-                        t = time.time() - start
-                        if t < 2:
-                            display.phase = "rewriting query"
-                        elif t < 3:
-                            display.phase = "searching the web"
-                        else:
-                            display.phase = "generating answer"
-                        live.update(display.render())
-                        time.sleep(0.12)
-
-                search_thread.join(timeout=1)
-                result = search_result[0]
+                result, search_err = call_with_spinner(
+                    lambda: quick_search(user_input),
+                    [(2, "rewriting query"), (3, "searching the web"),
+                     (float("inf"), "generating answer")], deadline=90)
                 elapsed = time.time() - start
+
+                if search_err is not None and result is None:
+                    console.print(f"  [yellow]search failed ({search_err})[/]\n")
 
                 if result:
                     response, speed = result
