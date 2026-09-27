@@ -10,7 +10,8 @@ echo ""
 # 1. Dependencies
 echo "  [1/5] Installing dependencies..."
 brew install llama.cpp 2>/dev/null || echo "  llama.cpp already installed"
-pip3 install huggingface-hub rich ddgs --break-system-packages -q 2>/dev/null
+brew install go 2>/dev/null || echo "  go already installed"
+pip3 install huggingface-hub rich ddgs -q 2>/dev/null
 
 # 2. Download model
 echo "  [2/5] Downloading Qwen3.5-35B-A3B (10.6 GB)..."
