@@ -240,12 +240,12 @@ def run_smart_tool(query, work_dir="."):
     # Step 1: LLM generates the command (~1s)
     cmd = generate_shell_command(query, work_dir)
 
-    # A truncated fragment (from a partial paste, or a model that stopped
-    # mid-token) is never worth running — it only produces a confusing error.
-    if not shell_command_looks_complete(cmd):
-        console.print(f"  [yellow]skipped an incomplete command:[/] [dim]{cmd[:120]}[/]")
-        console.print("  [dim]that looked like a cut-off paste — send the whole "
-                      "block in one go[/]\n")
+    # Never auto-run something destructive, self-referential, interactive, or
+    # truncated — all four produce a confusing failure instead of a useful one.
+    reason = shell_command_blocked(cmd)
+    if reason:
+        console.print(f"  [yellow]skipped:[/] [dim]{reason}[/]")
+        console.print(f"  [dim]command was: {cmd[:120]}[/]\n")
         return None, 0, cmd
 
     # Step 2: Execute it
@@ -576,6 +576,52 @@ Now the user asks:
 DESTRUCTIVE = ["rm ", "rm -", "mv ", "dd ", "mkfs", "chmod", "chown", "sudo",
                "kill", "shutdown", "reboot", "diskutil", "curl ", "wget ",
                "defaults delete", "> /dev/"]
+# Launching these from inside the agent nests a second copy of the program, or
+# blocks forever on a TTY the model cannot answer.
+SELF_SCRIPTS = ("agent.py", "chat.py", "dashboard.py", "mlx-sniper", "mlx_sniper")
+INTERACTIVE = ("vim", "vi", "nano", "emacs", "top", "htop", "less", "more",
+               "man", "watch", "ssh", "irb", "ftp", "telnet")
+BARE_SHELLS = ("sh", "bash", "zsh", "python", "python3", "node", "ruby")
+INTERPRETERS = ("python", "python3", "sh", "bash", "zsh", "node", "ruby", "perl")
+
+def shell_command_blocked(cmd):
+    """Reason this command must not be auto-run, or None if it is fine."""
+    low = cmd.strip().lower()
+    if not low:
+        return "the command was empty"
+    for d in DESTRUCTIVE:
+        if d in low:
+            return f"blocked as destructive ({d.strip()})"
+    toks = low.split()
+    base = os.path.basename(toks[0]) if toks else ""
+    # Only block when the script is actually being *executed* — as the command
+    # itself, or as an argument to an interpreter. `wc -l agent.py` merely names
+    # the file and must still be allowed.
+    if base in SELF_SCRIPTS:
+        return (f"refusing to launch {base} from inside the agent — it would "
+                "start a second copy that waits on the same terminal")
+    prev = base
+    for tok in toks[1:]:
+        if prev in INTERPRETERS and os.path.basename(tok) in SELF_SCRIPTS:
+            name = os.path.basename(tok)
+            return (f"refusing to launch {name} from inside the agent — it would "
+                    "start a second copy that waits on the same terminal")
+        if tok.startswith("./") and os.path.basename(tok) in SELF_SCRIPTS:
+            return (f"refusing to launch {os.path.basename(tok)} from inside the "
+                    "agent — it would start a second copy")
+        prev = tok
+    if base in BARE_SHELLS and len(toks) == 1:
+        return f"{base} with no arguments is interactive and would hang"
+    if "-m" in toks:
+        mod = toks[toks.index("-m") + 1] if toks.index("-m") + 1 < len(toks) else ""
+        if os.path.basename(mod) in SELF_SCRIPTS or mod in ("agent", "chat", "dashboard"):
+            return (f"refusing to run module '{mod}' from inside the agent — it "
+                    "would start a second copy that waits on the same terminal")
+    if base in INTERACTIVE:
+        return f"{base} is interactive and would hang"
+    if not shell_command_looks_complete(cmd):
+        return "the command looks cut off (unbalanced quotes or a trailing backslash)"
+    return None
 
 def _resolve(path, work_dir="."):
     p = os.path.expanduser((path or "").strip().strip('"').strip("'"))
@@ -637,11 +683,9 @@ def tool_ls(arg, work_dir="."):
 
 def tool_shell(arg, work_dir="."):
     cmd = arg.strip()
-    low = cmd.lower()
-    for d in DESTRUCTIVE:
-        if d in low:
-            return (f"Refused (blocked: {d.strip()}). To change files use "
-                    "<read> then <edit>. Use a different command for this.")
+    reason = shell_command_blocked(cmd)
+    if reason:
+        return f"Refused ({reason}). Run this outside the agent instead."
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
                            timeout=30, cwd=work_dir)
@@ -867,6 +911,10 @@ ATTR_REGEX = re.compile(r'<(write|edit)\s+path="([^"]+)"\s*>(.*?)</\1>', re.DOTA
 # stop sequence. Only the single-line read-only tools are recoverable; a
 # truncated <write>/<edit> body would silently drop content, so never guess.
 UNCLOSED_REGEX = re.compile(r"<(read|ls|search|shell)>([^<]*)$", re.DOTALL)
+# A <write>/<edit> that opened but never closed. Never completed automatically —
+# that would silently drop the tail of the content — but handed back to the model
+# as a retryable error instead of being rendered to the user as broken prose.
+TRUNCATED_REGEX = re.compile(r'<(write|edit)\s+path="([^"]+)"\s*>(.*)$', re.DOTALL)
 CODE_STOP = ["</read>", "</ls>", "</search>", "</shell>", "</write>", "</edit>"]
 
 def parse_code_tool(text):
@@ -883,10 +931,19 @@ def parse_code_tool(text):
     if m:
         return {"tool": m.group(1), "content": m.group(2).strip(),
                 "start": m.start(), "end": len(text), "recovered": True}
+    m = TRUNCATED_REGEX.search(text)
+    if m:
+        return {"tool": m.group(1), "path": m.group(2), "body": m.group(3),
+                "start": m.start(), "end": len(text), "truncated": True}
     return None
 
 def run_code_tool(call, work_dir="."):
     t = call["tool"]
+    if call.get("truncated"):
+        return (f"Your {t} call for {call.get('path')} was cut off — the closing "
+                f"</{t}> tag is missing — so nothing was written. Re-emit the "
+                "complete call including the closing tag. If the content is long, "
+                "make the change smaller: one edit per call, a few lines each.")
     if t == "read":   return tool_read(call["content"], work_dir)
     if t == "ls":     return tool_ls(call["content"], work_dir)
     if t == "shell":  return tool_shell(call["content"], work_dir)
