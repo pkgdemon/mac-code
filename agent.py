@@ -104,6 +104,46 @@ TOOL_KEYWORDS = [
 
 VALID_INTENTS = ("search", "code", "shell", "chat")
 
+# Sent on every conversational turn. Without it the model gets a bare user
+# message, falls back to its base-instruct persona, and claims it cannot edit
+# files — which is exactly the opposite of what this agent can do.
+DEFAULT_SYSTEM_PROMPT = """You are mac code, a coding agent running on the user's own Mac in {work_dir}.
+
+You DO have file tools. You can read, create, and edit files in that directory. When the user asks for a change, the request is routed to your tools automatically: you read the file, produce the edit, and the user sees a diff and approves it before anything touches disk.
+
+So never say you cannot edit files, that you lack permission, or that you are read-only. You can. If someone asks whether you can make a change, answer yes and ask what specifically to change.
+
+You are answering in conversation mode right now, so keep it short and concrete. When the user wants a file actually changed, name the change you would make and ask for the specifics — the edit itself runs through your tools, not through this reply."""
+
+def with_system(messages, work_dir="."):
+    """Prepend the default system prompt unless /system already set one."""
+    if messages and messages[0]["role"] == "system":
+        return messages
+    return [{"role": "system",
+             "content": DEFAULT_SYSTEM_PROMPT.format(work_dir=work_dir)}] + messages
+
+# Deterministic safety net for routing. A mis-routed edit request fails
+# silently — the model just answers in chat and never touches a file — so
+# catch unambiguous edit requests before that happens.
+EDIT_VERB_RE = re.compile(
+    r"\b(add|append|create|write|implement|refactor|rename|delete|remove|"
+    r"fix|repair|update|change|edit|modify|replace|rewrite|convert|port|"
+    r"introduce|extract|generate|insert|patch|reorder|comment|annotate)\b", re.I)
+CODE_TARGET_RE = re.compile(
+    r"\b\w+\.(py|js|jsx|ts|tsx|json|md|txt|sh|bash|zsh|go|rs|java|rb|php|"
+    r"c|h|cpp|hpp|cs|swift|kt|sql|html|css|yml|yaml|toml|ini)\b|"
+    r"\b(function|method|class|module|script|import|variable|constant|"
+    r"line \d+|def |bug|error|exception|traceback|refactor|codebase|repo)\b", re.I)
+# Questions about what you can do, or asking for an explanation, are not edits.
+META_QUESTION_RE = re.compile(
+    r"^\s*(are|is|can|could|do|does|did|would|will|should|what|why|how|who|"
+    r"when|where|which|explain|describe|tell me about)\b", re.I)
+
+def looks_like_edit_request(message):
+    if META_QUESTION_RE.match(message):
+        return False
+    return bool(EDIT_VERB_RE.search(message) and CODE_TARGET_RE.search(message))
+
 def classify_intent(message):
     """Ask LLM to classify: 'search', 'shell', 'code', or 'chat'. One fast call (~1s)."""
     try:
@@ -794,7 +834,9 @@ def run_code_agent(user_input, work_dir=".", history=None,
     full exchange including tool results so the caller can persist it as history.
     """
     convo = [{"role": "system", "content": CODE_SYSTEM_PROMPT.format(work_dir=work_dir)}]
-    convo += [dict(m) for m in (history or [])]
+    # Drop any system message from history (e.g. one set via /system) — two
+    # system prompts in one request makes the smaller models behave erratically.
+    convo += [dict(m) for m in (history or []) if m.get("role") != "system"]
     convo.append({"role": "user", "content": user_input})
 
     used = []
@@ -1650,6 +1692,12 @@ def main():
             cls_thread.join(timeout=1)
             intent = intent_result[0] or "chat"
 
+            # Safety net: a mis-routed edit request is invisible — the model
+            # just answers in chat and no file is ever touched. Catch the
+            # unambiguous ones and send them to the code agent instead.
+            if intent in ("chat", "shell") and looks_like_edit_request(user_input):
+                intent = "code"
+
             # Route based on LLM classification
             if intent == "shell":
                 # File/system operations → LLM generates shell command
@@ -1763,7 +1811,7 @@ def main():
                     first_token = True
                     display.phase = "thinking"
                     with Live(display.render(), console=console, refresh_per_second=8, transient=True) as live:
-                        gen = stream_llm(messages)
+                        gen = stream_llm(with_system(messages, work_dir))
                         for chunk in gen:
                             if isinstance(chunk, str):
                                 if first_token:
@@ -1826,7 +1874,7 @@ def main():
                 display.phase = "thinking"
                 try:
                     with Live(display.render(), console=console, refresh_per_second=8, transient=True) as live:
-                        gen = stream_llm(messages)
+                        gen = stream_llm(with_system(messages, work_dir))
                         for chunk in gen:
                             if isinstance(chunk, str):
                                 if first_token:
@@ -1861,7 +1909,7 @@ def main():
                 first_token = True
 
                 with Live(display.render(), console=console, refresh_per_second=8, transient=True) as live:
-                    gen = stream_llm(messages)
+                    gen = stream_llm(with_system(messages, work_dir))
                     for chunk in gen:
                         if isinstance(chunk, str):
                             if first_token:
