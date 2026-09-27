@@ -29,7 +29,7 @@ The fastest option. Uses llama.cpp with a 2-bit quantization (IQ2_M) that fits e
 
 ```bash
 brew install llama.cpp
-pip3 install rich ddgs --break-system-packages
+pip3 install rich ddgs
 
 # Download model (10.6 GB)
 python3 -c "
